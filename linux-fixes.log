@@ -1,0 +1,149 @@
+# Linux Setup Fixes for stable-diffusion-webui-forge
+# Date: 2026-03-18
+# Author: Qwen Code Assistant
+
+## Summary
+Fixed multiple errors preventing ./webui.sh from running successfully on Linux.
+Created fix-setup.sh script that can be run to automatically apply all fixes.
+
+## Issues Found and Fixed
+
+### 1. Missing pkg_resources Module (CLIP Installation Failure)
+**Error:**
+```
+ModuleNotFoundError: No module named 'pkg_resources'
+```
+
+**Root Cause:**
+The CLIP package (https://github.com/openai/CLIP) requires pkg_resources during build,
+which is part of setuptools. The build isolation phase in pip was creating a temporary
+build environment without pkg_resources.
+
+**Fix:**
+- Modified `modules/launch_utils.py` to install setuptools and wheel before installing CLIP
+- Added `--no-build-isolation` flag to CLIP and open_clip installations
+
+### 2. Missing wheel Package
+**Error:**
+```
+error: invalid command 'bdist_wheel'
+```
+
+**Root Cause:**
+The wheel package was not installed, preventing building of packages from source.
+
+**Fix:**
+- Added wheel installation in `modules/launch_utils.py` before CLIP installation
+
+### 3. NumPy Version Incompatibility with scikit-image
+**Error:**
+```
+ValueError: numpy.dtype size changed, may indicate binary incompatibility. 
+Expected 96 from C header, got 88 from PyObject
+```
+
+**Root Cause:**
+- torch 2.3.1+cu121 pulls in numpy 2.x as a dependency
+- scikit-image==0.21.0 is only compatible with numpy 1.x
+- Other packages (mediapipe, onnxruntime) also reinstall numpy 2.x
+
+**Fix:**
+- Updated `requirements_versions.txt` to specify: `numpy<2.0.0,>=1.26.2`
+- Added numpy downgrade code AFTER all package installations (including extensions)
+- Reinstall scikit-image with `--no-deps` flag after numpy downgrade
+
+### 4. Missing joblib Dependency
+**Error:**
+```
+ModuleNotFoundError: No module named 'joblib'
+```
+
+**Root Cause:**
+The soft-inpainting extension requires joblib but it wasn't listed in requirements.
+
+**Fix:**
+- Added joblib==1.3.2 to requirements_versions.txt
+
+## Files Changed
+
+### modules/launch_utils.py
+Added after `startup_timer.record("torch GPU test")`:
+```python
+if not is_installed("setuptools"):
+    run_pip("install -U setuptools", "setuptools")
+    startup_timer.record("install setuptools")
+
+if not is_installed("wheel"):
+    run_pip("install -U wheel", "wheel")
+    startup_timer.record("install wheel")
+```
+
+Modified CLIP installation:
+```python
+if not is_installed("clip"):
+    run_pip(f"install {clip_package} --no-build-isolation", "clip")
+    startup_timer.record("install clip")
+
+if not is_installed("open_clip"):
+    run_pip(f"install {openclip_package} --no-build-isolation", "open_clip")
+    startup_timer.record("install open_clip")
+```
+
+Added after `run_extensions_installers()`:
+```python
+# Downgrade numpy if version 2.x is installed (incompatible with scikit-image)
+import subprocess
+result = subprocess.run([python, "-c", "import numpy; print(numpy.__version__)"], capture_output=True, text=True)
+if result.returncode == 0 and result.stdout.strip().startswith("2."):
+    run_pip("install 'numpy<2.0.0,>=1.26.2' --force-reinstall", "downgrade numpy")
+    run_pip("install scikit-image==0.21.0 --force-reinstall --no-cache-dir --no-deps", "reinstall scikit-image")
+startup_timer.record("downgrade numpy")
+```
+
+### requirements_versions.txt
+```
+# Line 14: Added
+joblib==1.3.2
+
+# Line 17: Changed
+numpy<2.0.0,>=1.26.2  # was: numpy==1.26.2
+```
+
+## Usage
+
+To apply fixes automatically, run:
+```bash
+./fix-setup.sh
+```
+
+To restore original files after testing:
+```bash
+cp .fix_backup_*/launch_utils.py.bak modules/launch_utils.py
+cp .fix_backup_*/requirements_versions.txt.bak requirements_versions.txt
+```
+
+## Verification
+After applying fixes, the web UI starts successfully:
+```
+Launching Web UI with arguments: 
+Total VRAM 7840 MB, total RAM 31773 MB
+pytorch version: 2.3.1+cu121
+Set vram state to: NORMAL_VRAM
+Device: cuda:0 NVIDIA GeForce RTX 3070 Laptop GPU : native
+Running on local URL:  http://127.0.0.1:7860
+Startup time: ~30s
+```
+
+## Additional Notes
+- There is still a warning about insightface not being installed automatically for 
+  the Legacy Preprocessor. This is expected and users are instructed to manually 
+  install it if needed: `pip install insightface`
+- The opencv-contrib-python package has a dependency warning about numpy version, 
+  but this doesn't affect functionality
+
+## Testing Environment
+- OS: Linux (glibc 2.39)
+- Python: 3.10.18
+- GPU: NVIDIA GeForce RTX 3070 Laptop GPU
+- CUDA: 12.1
+- torch: 2.3.1+cu121
